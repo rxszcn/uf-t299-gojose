@@ -18,10 +18,14 @@
 package jwt
 
 import (
+	"encoding/base64"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"fmt"
 	"maps"
 	"reflect"
+	"slices"
+	"strings"
 
 	"github.com/go-jose/go-jose/v5"
 )
@@ -74,6 +78,9 @@ type nestedBuilder struct {
 	builder
 	sig jose.Signer
 	enc jose.Encrypter
+	// allowedSignatureAlgorithms, when non-nil, is an explicit allowlist for the
+	// inner JWS. When nil, Token derives it from the JWS this builder produces.
+	allowedSignatureAlgorithms []jose.SignatureAlgorithm
 }
 
 // Signed creates builder for signed tokens.
@@ -92,7 +99,36 @@ func Encrypted(enc jose.Encrypter) Builder {
 
 // SignedAndEncrypted creates builder for signed-then-encrypted tokens.
 // ErrInvalidContentType will be returned if encrypter doesn't have JWT content type.
+//
+// Tokens produced by this builder carry an inner-JWS allowlist derived from the
+// algorithm(s) the signer actually used, so NestedJSONWebToken.Decrypt works on
+// the token directly, without a serialization round trip. Use
+// SignedAndEncryptedWithAlgorithms when an explicit allowlist is required.
 func SignedAndEncrypted(sig jose.Signer, enc jose.Encrypter) NestedBuilder {
+	return newNestedBuilder(sig, enc, nil)
+}
+
+// SignedAndEncryptedWithAlgorithms is like SignedAndEncrypted, but pins the
+// allowlist that NestedJSONWebToken.Decrypt applies to the inner JWS "alg"
+// header parameter.
+//
+// Passing a non-empty allowlist means a token whose inner signature uses an
+// algorithm outside it is rejected with ErrSignatureAlgorithmNotAllowed at
+// decryption time, even for an in-process token. Passing an empty allowlist is
+// equivalent to SignedAndEncrypted.
+//
+// The allowlist is a property of the decryption side, not the signing side:
+// issuers that may sign with more than one algorithm declare all of them here
+// so that any of those tokens still decrypts.
+func SignedAndEncryptedWithAlgorithms(
+	sig jose.Signer,
+	enc jose.Encrypter,
+	allowedSignatureAlgorithms []jose.SignatureAlgorithm,
+) NestedBuilder {
+	return newNestedBuilder(sig, enc, allowedSignatureAlgorithms)
+}
+
+func newNestedBuilder(sig jose.Signer, enc jose.Encrypter, allowed []jose.SignatureAlgorithm) NestedBuilder {
 	if contentType, _ := enc.Options().ExtraHeaders[jose.HeaderContentType].(jose.ContentType); contentType != "JWT" {
 		return &nestedBuilder{
 			builder: builder{
@@ -100,9 +136,15 @@ func SignedAndEncrypted(sig jose.Signer, enc jose.Encrypter) NestedBuilder {
 			},
 		}
 	}
+	if len(allowed) == 0 {
+		allowed = nil
+	} else {
+		allowed = slices.Clone(allowed)
+	}
 	return &nestedBuilder{
-		sig: sig,
-		enc: enc,
+		sig:                        sig,
+		enc:                        enc,
+		allowedSignatureAlgorithms: allowed,
 	}
 }
 
@@ -255,29 +297,42 @@ func (b *encryptedBuilder) encrypt() (*jose.JSONWebEncryption, error) {
 
 func (b *nestedBuilder) Claims(i any) NestedBuilder {
 	return &nestedBuilder{
-		builder: b.builder.claims(i),
-		sig:     b.sig,
-		enc:     b.enc,
+		builder:                    b.builder.claims(i),
+		sig:                        b.sig,
+		enc:                        b.enc,
+		allowedSignatureAlgorithms: b.allowedSignatureAlgorithms,
 	}
 }
 
-// Token produced a token suitable for serialization. It cannot be decrypted
-// without serializing and then deserializing.
+// Token produces a token that can be decrypted in-process with Decrypt, without
+// a serialize/parse round trip.
+//
+// The inner JWS is preserved as produced by the signer, so the "alg" header
+// parameter is validated against the allowlist on Decrypt exactly as it would be
+// for a parsed token.
 func (b *nestedBuilder) Token() (*NestedJSONWebToken, error) {
-	enc, err := b.signAndEncrypt()
+	inner, enc, err := b.signAndEncrypt()
 	if err != nil {
 		return nil, err
 	}
 
+	allowed := b.allowedSignatureAlgorithms
+	if allowed == nil {
+		allowed, err = signatureAlgorithmsOf(inner)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &NestedJSONWebToken{
-		allowedSignatureAlgorithms: nil,
+		allowedSignatureAlgorithms: allowed,
 		enc:                        enc,
 		Headers:                    []jose.Header{enc.Header},
 	}, nil
 }
 
 func (b *nestedBuilder) Serialize() (string, error) {
-	enc, err := b.signAndEncrypt()
+	_, enc, err := b.signAndEncrypt()
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +341,7 @@ func (b *nestedBuilder) Serialize() (string, error) {
 }
 
 func (b *nestedBuilder) FullSerialize() (string, error) {
-	enc, err := b.signAndEncrypt()
+	_, enc, err := b.signAndEncrypt()
 	if err != nil {
 		return "", err
 	}
@@ -294,25 +349,64 @@ func (b *nestedBuilder) FullSerialize() (string, error) {
 	return enc.FullSerialize(), nil
 }
 
-func (b *nestedBuilder) signAndEncrypt() (*jose.JSONWebEncryption, error) {
+// signAndEncrypt signs the claims, then encrypts the inner JWS. It returns the
+// inner compact serialization that was encrypted along with the outer JWE.
+// Token needs the inner serialization so it can read the "alg" header parameter
+// the signer emitted, instead of guessing it, and so the allowlist is derived
+// from exactly the bytes that Decrypt will later parse.
+func (b *nestedBuilder) signAndEncrypt() (string, *jose.JSONWebEncryption, error) {
 	if b.err != nil {
-		return nil, b.err
+		return "", nil, b.err
 	}
 
 	p, err := json.Marshal(b.payload, json.Deterministic(true))
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	sig, err := b.sig.Sign(p)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	p2, err := sig.CompactSerialize()
+	inner, err := sig.CompactSerialize()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	return b.enc.Encrypt([]byte(p2))
+	enc, err := b.enc.Encrypt([]byte(inner))
+	if err != nil {
+		return "", nil, err
+	}
+
+	return inner, enc, nil
+}
+
+// signatureAlgorithmsOf reads the "alg" header parameter out of an inner JWS in
+// compact serialization, which is what Decrypt will parse.
+//
+// The signer's Signature.Protected header is not populated by Sign (it is a
+// merged view filled in during parsing), so the header has to be read from the
+// serialized form.
+func signatureAlgorithmsOf(inner string) ([]jose.SignatureAlgorithm, error) {
+	encodedHeader, _, ok := strings.Cut(inner, ".")
+	if !ok {
+		return nil, fmt.Errorf("%w: inner signed object is not in compact serialization", ErrSignatureAlgorithmNotAllowed)
+	}
+	rawHeader, err := base64.RawURLEncoding.DecodeString(encodedHeader)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot decode inner signature header: %w", ErrSignatureAlgorithmNotAllowed, err)
+	}
+
+	var header struct {
+		Algorithm jose.SignatureAlgorithm `json:"alg"`
+	}
+	if err := json.Unmarshal(rawHeader, &header); err != nil {
+		return nil, fmt.Errorf("%w: cannot decode inner signature header: %w", ErrSignatureAlgorithmNotAllowed, err)
+	}
+	if header.Algorithm == "" {
+		return nil, fmt.Errorf("%w: inner signature header has no alg parameter", ErrSignatureAlgorithmNotAllowed)
+	}
+
+	return []jose.SignatureAlgorithm{header.Algorithm}, nil
 }

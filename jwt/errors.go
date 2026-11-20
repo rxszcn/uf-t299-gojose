@@ -51,3 +51,16 @@ var ErrIssuedInTheFuture = errors.New("go-jose/go-jose/jwt: validation failed, t
 
 // ErrInvalidContentType indicates that token requires JWT cty header.
 var ErrInvalidContentType = errors.New("go-jose/go-jose/jwt: expected content type to be JWT (cty header)")
+
+// ErrDecryptionFailed indicates that the outer JWE of a nested token could not
+// be decrypted. It wraps the underlying error, so errors.Is also matches the
+// inner cause (for example jose.ErrCryptoFailure).
+var ErrDecryptionFailed = errors.New("go-jose/go-jose/jwt: nested token decryption failed")
+
+// ErrSignatureAlgorithmNotAllowed indicates that the inner JWS of a nested
+// token could not be accepted because its "alg" header parameter is outside
+// the allowlist supplied to the caller, or because no allowlist is configured
+// at all. It wraps the underlying error, so errors.As still exposes
+// *jose.ErrUnexpectedSignatureAlgorithm when the token names a disallowed
+// algorithm.
+var ErrSignatureAlgorithmNotAllowed = errors.New("go-jose/go-jose/jwt: nested token inner signature algorithm not allowed")

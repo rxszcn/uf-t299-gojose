@@ -254,6 +254,94 @@ func ExampleSignedAndEncrypted() {
 	fmt.Println(raw)
 }
 
+// ExampleNestedBuilder_Token shows the in-process path: the nested token is
+// decrypted directly, without serializing it first. The inner signature is still
+// checked against the allowlist recorded on the token.
+func ExampleNestedBuilder_Token() {
+	enc, err := jose.NewEncrypter(
+		jose.A128GCM,
+		jose.Recipient{
+			Algorithm: jose.DIRECT,
+			Key:       sharedEncryptionKey,
+		},
+		(&jose.EncrypterOptions{}).WithType("JWT").WithContentType("JWT"))
+	if err != nil {
+		fmt.Printf("making encrypter: %s\n", err)
+		return
+	}
+
+	cl := jwt.Claims{
+		Subject: "subject",
+		Issuer:  "issuer",
+	}
+
+	// The default builder permits exactly the inner algorithm it signed with.
+	tok, err := jwt.SignedAndEncrypted(rsaSigner, enc).Claims(cl).Token()
+	if err != nil {
+		fmt.Printf("encrypting and signing JWT: %s\n", err)
+		return
+	}
+
+	inner, err := tok.Decrypt(sharedEncryptionKey)
+	if err != nil {
+		fmt.Printf("decrypting JWT: %s\n", err)
+		return
+	}
+
+	out := jwt.Claims{}
+	if err := inner.Claims(&rsaPrivKey.PublicKey, &out); err != nil {
+		fmt.Printf("validating claims: %s\n", err)
+		return
+	}
+
+	fmt.Printf("iss: %s, sub: %s\n", out.Issuer, out.Subject)
+	// Output: iss: issuer, sub: subject
+}
+
+// ExampleSignedAndEncryptedWithAlgorithms pins the inner-JWS allowlist. An issuer
+// that may sign with more than one algorithm declares all of them, so any of
+// those tokens decrypts; anything else is rejected with
+// jwt.ErrSignatureAlgorithmNotAllowed.
+func ExampleSignedAndEncryptedWithAlgorithms() {
+	enc, err := jose.NewEncrypter(
+		jose.A128GCM,
+		jose.Recipient{
+			Algorithm: jose.DIRECT,
+			Key:       sharedEncryptionKey,
+		},
+		(&jose.EncrypterOptions{}).WithType("JWT").WithContentType("JWT"))
+	if err != nil {
+		fmt.Printf("making encrypter: %s\n", err)
+		return
+	}
+
+	// Both algorithms are on the allowlist, so either may be used to sign.
+	allowed := []jose.SignatureAlgorithm{jose.RS256, jose.PS256}
+
+	tok, err := jwt.SignedAndEncryptedWithAlgorithms(rsaSigner, enc, allowed).
+		Claims(jwt.Claims{Subject: "subject", Issuer: "issuer"}).
+		Token()
+	if err != nil {
+		fmt.Printf("encrypting and signing JWT: %s\n", err)
+		return
+	}
+
+	inner, err := tok.Decrypt(sharedEncryptionKey)
+	if err != nil {
+		fmt.Printf("decrypting JWT: %s\n", err)
+		return
+	}
+
+	out := jwt.Claims{}
+	if err := inner.Claims(&rsaPrivKey.PublicKey, &out); err != nil {
+		fmt.Printf("validating claims: %s\n", err)
+		return
+	}
+
+	fmt.Printf("iss: %s, sub: %s\n", out.Issuer, out.Subject)
+	// Output: iss: issuer, sub: subject
+}
+
 func ExampleSigned_multipleClaims() {
 	c := &jwt.Claims{
 		Subject: "subject",

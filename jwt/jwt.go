@@ -19,6 +19,7 @@ package jwt
 
 import (
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -35,7 +36,12 @@ type JSONWebToken struct {
 type NestedJSONWebToken struct {
 	enc     *jose.JSONWebEncryption
 	Headers []jose.Header
-	// Used when parsing and decrypting an input
+	// allowedSignatureAlgorithms is the allowlist applied to the "alg" header
+	// parameter of the inner JWS. Tokens returned by ParseSignedAndEncrypted
+	// carry the caller-supplied allowlist; tokens returned by
+	// NestedBuilder.Token carry the algorithms actually present in the inner
+	// JWS that the builder just produced, which is the tightest allowlist that
+	// is still sound for an in-process token.
 	allowedSignatureAlgorithms []jose.SignatureAlgorithm
 }
 
@@ -71,14 +77,42 @@ func (t *JSONWebToken) UnsafeClaimsWithoutVerification(dest ...any) error {
 	return nil
 }
 
+// Decrypt decrypts the outer JWE and parses the inner JWS that it carries.
+//
+// The inner JWS "alg" header parameter is validated against the allowlist
+// recorded on the token:
+//
+//   - tokens from ParseSignedAndEncrypted use the allowlist given to that
+//     function;
+//   - tokens from NestedBuilder.Token use the algorithm(s) the builder actually
+//     signed with, unless SignedAndEncryptedWithAlgorithms supplied an explicit
+//     allowlist.
+//
+// Errors are classified so callers can tell the failure modes apart:
+//
+//   - ErrDecryptionFailed: the outer JWE could not be decrypted (errors.Is also
+//     matches the underlying cause, e.g. jose.ErrCryptoFailure);
+//   - ErrSignatureAlgorithmNotAllowed: the JWE decrypted but the inner "alg" is
+//     not in the allowlist, or no allowlist is configured (errors.As exposes
+//     *jose.ErrUnexpectedSignatureAlgorithm when the header names an algorithm);
+//   - ErrInvalidContentType: reported by ParseSignedAndEncrypted when the JWE
+//     "cty" header is not JWT.
 func (t *NestedJSONWebToken) Decrypt(decryptionKey any) (*JSONWebToken, error) {
 	b, err := t.enc.Decrypt(decryptionKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrDecryptionFailed, err)
+	}
+
+	if len(t.allowedSignatureAlgorithms) == 0 {
+		return nil, fmt.Errorf("%w: no signature algorithm allowlist configured", ErrSignatureAlgorithmNotAllowed)
 	}
 
 	sig, err := ParseSigned(string(b), t.allowedSignatureAlgorithms)
 	if err != nil {
+		var algErr *jose.ErrUnexpectedSignatureAlgorithm
+		if errors.As(err, &algErr) {
+			return nil, fmt.Errorf("%w: %w", ErrSignatureAlgorithmNotAllowed, err)
+		}
 		return nil, err
 	}
 
